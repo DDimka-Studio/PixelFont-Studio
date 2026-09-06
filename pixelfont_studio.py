@@ -3,8 +3,15 @@
 """
 PixelFont Studio — a pixel font editor for 8x8 / 16x16 / 32x32 fonts.
 
-Every glyph (uppercase and lowercase) is stored as a separate .svg file,
-which can be edited with any editor and loaded back in.
+Glyphs are NOT auto-generated for a fixed alphabet. Each project keeps an
+explicit glyph registry (Unicode code point -> file name) that the user
+builds by hand: add a letter, a punctuation mark, a quote, a space glyph,
+or any other Unicode character via the "+ Add" button in the left panel,
+picking it either by typing it, by its hex code point, or by browsing a
+Unicode table grouped by block/category.
+
+Every glyph is stored as a separate .svg file, which can be edited with
+any editor and loaded back in.
 Export formats: .otf, .ttf, .ttc, .bdf, .h
 
 Dependencies:
@@ -16,7 +23,9 @@ Run:
 
 import json
 import os
+import re
 import sys
+import unicodedata
 import xml.etree.ElementTree as ET
 
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -24,13 +33,86 @@ from PyQt6.QtGui import QAction, QColor, QKeySequence, QPalette, QPainter
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFrame, QGroupBox, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QMessageBox, QPushButton, QSplitter,
-    QVBoxLayout, QWidget,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+    QPushButton, QSplitter, QVBoxLayout, QWidget,
 )
 
 SVG_NS = "http://www.w3.org/2000/svg"
-GLYPHS = [chr(c) for c in range(65, 91)] + [chr(c) for c in range(97, 123)]  # A-Z, a-z
 SIZES = [8, 16, 32]
+
+# The starting glyph set for a brand-new project — a convenient default,
+# not a hard limit. Anything else (punctuation, quotes, space, currency
+# signs, other scripts...) is added on demand through the "+ Add" dialog.
+DEFAULT_LATIN = [chr(c) for c in range(65, 91)] + [chr(c) for c in range(97, 123)]
+
+# Unicode blocks offered in the "Browse Unicode table" picker, grouped
+# roughly by script/category so the user can find a symbol by "language
+# or category" instead of hunting for the exact code point.
+UNICODE_BLOCKS = [
+    ("Basic Latin (ASCII)", 0x0020, 0x007E),
+    ("Latin-1 Supplement", 0x00A0, 0x00FF),
+    ("Latin Extended-A", 0x0100, 0x017F),
+    ("Latin Extended-B", 0x0180, 0x024F),
+    ("Greek and Coptic", 0x0370, 0x03FF),
+    ("Cyrillic", 0x0400, 0x04FF),
+    ("Cyrillic Supplement", 0x0500, 0x052F),
+    ("Hebrew", 0x0590, 0x05FF),
+    ("Arabic", 0x0600, 0x06FF),
+    ("General Punctuation", 0x2000, 0x206F),
+    ("Superscripts and Subscripts", 0x2070, 0x209F),
+    ("Currency Symbols", 0x20A0, 0x20CF),
+    ("Letterlike Symbols", 0x2100, 0x214F),
+    ("Number Forms", 0x2150, 0x218F),
+    ("Arrows", 0x2190, 0x21FF),
+    ("Mathematical Operators", 0x2200, 0x22FF),
+    ("Box Drawing", 0x2500, 0x257F),
+    ("Block Elements", 0x2580, 0x259F),
+    ("Geometric Shapes", 0x25A0, 0x25FF),
+    ("Miscellaneous Symbols", 0x2600, 0x26FF),
+    ("Dingbats", 0x2700, 0x27BF),
+]
+
+_BAD_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_LEGACY_SVG_RE = re.compile(r'^([0-9A-Fa-f]+)_(.+)\.svg$')
+
+
+def sanitize_filename(name):
+    name = _BAD_FILENAME_CHARS.sub("_", name.strip())
+    return name.strip(". ")
+
+
+def default_filename(cp):
+    """A readable, collision-safe default name: hex code point + a hint."""
+    ch = chr(cp)
+    if ch == " ":
+        hint = "space"
+    elif ch.isprintable() and not _BAD_FILENAME_CHARS.search(ch):
+        hint = ch
+    else:
+        hint = f"u{cp:04X}"
+    return f"{cp:04X}_{hint}"
+
+
+def default_glyph_entries():
+    return [{"codepoint": ord(ch), "filename": default_filename(ord(ch))} for ch in DEFAULT_LATIN]
+
+
+def discover_legacy_glyphs(project_dir):
+    """Older projects had no glyph registry — their .svg files were named
+    '{HEX}_{char}.svg'. Reconstruct a registry from those file names so
+    existing projects keep working after upgrading."""
+    found = {}
+    for s in SIZES:
+        d = os.path.join(project_dir, f"size_{s}")
+        if not os.path.isdir(d):
+            continue
+        for fname in os.listdir(d):
+            m = _LEGACY_SVG_RE.match(fname)
+            if m:
+                cp = int(m.group(1), 16)
+                found[cp] = fname[:-4]  # strip ".svg"
+    return [{"codepoint": cp, "filename": base} for cp, base in sorted(found.items())]
+
 
 # ================================================================ theme / appearance settings
 
@@ -172,6 +254,20 @@ def build_stylesheet(t):
         border: 1px solid {t['border']};
         selection-background-color: #2b2b47;
     }}
+    QListWidget {{
+        background-color: {t['bg_base']};
+        border: 1px solid {t['border']};
+        border-radius: 8px;
+        outline: none;
+    }}
+    QListWidget::item {{
+        padding: 4px 6px;
+        border-radius: 4px;
+    }}
+    QListWidget::item:selected {{
+        background-color: {t['accent']};
+        color: white;
+    }}
     QCheckBox {{
         spacing: 8px;
         padding: 2px;
@@ -288,6 +384,214 @@ class SettingsDialog(QDialog):
         return self.theme
 
 
+# ================================================================ Unicode table picker
+
+class UnicodeLookupDialog(QDialog):
+    """Browse Unicode characters by block/category, with a name search,
+    so the user can find the exact code point of a symbol without
+    knowing it up front."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Unicode Character Table")
+        self.resize(480, 520)
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(8)
+
+        row = QHBoxLayout()
+        lab = QLabel("Category:")
+        lab.setProperty("role", "dim")
+        row.addWidget(lab)
+        self.block_combo = QComboBox()
+        for name, start, end in UNICODE_BLOCKS:
+            self.block_combo.addItem(name, (start, end))
+        row.addWidget(self.block_combo, 1)
+        lay.addLayout(row)
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search by Unicode name (e.g. \"quote\", \"arrow\")…")
+        lay.addWidget(self.search_edit)
+
+        self.list = QListWidget()
+        lay.addWidget(self.list, 1)
+
+        self.count_label = QLabel()
+        self.count_label.setProperty("role", "dim")
+        lay.addWidget(self.count_label)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setProperty("role", "accent")
+        lay.addWidget(bb)
+
+        self.block_combo.currentIndexChanged.connect(self._refresh)
+        self.search_edit.textChanged.connect(self._refresh)
+        self.list.itemDoubleClicked.connect(self.accept)
+        self._refresh()
+
+    def _refresh(self):
+        self.list.clear()
+        start, end = self.block_combo.currentData()
+        query = self.search_edit.text().strip().lower()
+        shown = 0
+        for cp in range(start, end + 1):
+            ch = chr(cp)
+            try:
+                name = unicodedata.name(ch)
+            except ValueError:
+                continue  # unassigned code point
+            if unicodedata.category(ch).startswith("C"):
+                continue  # control / format / surrogate / unassigned-ish
+            if query and query not in name.lower():
+                continue
+            item = QListWidgetItem(f"U+{cp:04X}   {ch}   {name}")
+            item.setData(Qt.ItemDataRole.UserRole, cp)
+            self.list.addItem(item)
+            shown += 1
+        self.count_label.setText(f"{shown} character(s)")
+        if self.list.count():
+            self.list.setCurrentRow(0)
+
+    def selected_char(self):
+        item = self.list.currentItem()
+        if item:
+            return chr(item.data(Qt.ItemDataRole.UserRole))
+        return None
+
+
+# ================================================================ add-glyph dialog
+
+class AddGlyphDialog(QDialog):
+    """Lets the user pick a Unicode character (by typing it, by hex code
+    point, or via the Unicode table) and give the underlying .svg file a
+    name of their choosing."""
+
+    def __init__(self, existing_codepoints, existing_filenames, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Glyph")
+        self.setMinimumWidth(380)
+        self.existing_codepoints = existing_codepoints
+        self.existing_filenames = existing_filenames
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        lab = QLabel("Character:")
+        lab.setProperty("role", "dim")
+        lay.addWidget(lab)
+        char_row = QHBoxLayout()
+        self.char_edit = QLineEdit()
+        self.char_edit.setMaxLength(1)
+        self.char_edit.setFixedWidth(60)
+        char_row.addWidget(self.char_edit)
+        self.info_label = QLabel("—")
+        char_row.addWidget(self.info_label, 1)
+        lay.addLayout(char_row)
+
+        hex_row = QHBoxLayout()
+        lab = QLabel("…or code point U+")
+        lab.setProperty("role", "dim")
+        hex_row.addWidget(lab)
+        self.hex_edit = QLineEdit()
+        self.hex_edit.setPlaceholderText("2022")
+        self.hex_edit.setFixedWidth(80)
+        hex_row.addWidget(self.hex_edit)
+        use_hex_btn = QPushButton("Use")
+        use_hex_btn.clicked.connect(self._use_hex)
+        hex_row.addWidget(use_hex_btn)
+        hex_row.addStretch()
+        lay.addLayout(hex_row)
+
+        browse_btn = QPushButton("🔎 Browse Unicode table…")
+        browse_btn.clicked.connect(self._open_lookup)
+        lay.addWidget(browse_btn)
+
+        lab = QLabel("File name (used on disk, not shown to font users):")
+        lab.setProperty("role", "dim")
+        lay.addWidget(lab)
+        self.filename_edit = QLineEdit()
+        lay.addWidget(self.filename_edit)
+
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet("color: #ff6b6b;")
+        self.error_label.setWordWrap(True)
+        lay.addWidget(self.error_label)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        self.ok_button = bb.button(QDialogButtonBox.StandardButton.Ok)
+        self.ok_button.setProperty("role", "accent")
+        lay.addWidget(bb)
+
+        self.char_edit.textChanged.connect(self._char_changed)
+        self.filename_edit.textChanged.connect(self._validate)
+        self._validate()
+
+    def _char_changed(self, text):
+        if text:
+            cp = ord(text)
+            try:
+                name = unicodedata.name(text)
+            except ValueError:
+                name = "(unnamed code point)"
+            self.info_label.setText(f"U+{cp:04X}  {name}")
+            if not self.filename_edit.text().strip():
+                self.filename_edit.setText(default_filename(cp))
+        else:
+            self.info_label.setText("—")
+        self._validate()
+
+    def _use_hex(self):
+        text = self.hex_edit.text().strip().lstrip("Uu+")
+        try:
+            cp = int(text, 16)
+            if not (0 <= cp <= 0xFFFF):
+                raise ValueError
+        except ValueError:
+            QMessageBox.warning(self, "Invalid code point",
+                               "Enter a valid hexadecimal code point in the Basic "
+                               "Multilingual Plane, e.g. 2022 for •.")
+            return
+        self.char_edit.setText(chr(cp))
+
+    def _open_lookup(self):
+        dlg = UnicodeLookupDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            ch = dlg.selected_char()
+            if ch:
+                self.char_edit.setText(ch)
+
+    def _validate(self):
+        text = self.char_edit.text()
+        ok = bool(text)
+        msg = ""
+        if ok:
+            cp = ord(text)
+            if cp in self.existing_codepoints:
+                ok = False
+                msg = "This character is already in the project's glyph list."
+        fname = sanitize_filename(self.filename_edit.text())
+        if ok and not fname:
+            ok = False
+            msg = "Enter a file name."
+        self.error_label.setText(msg)
+        self.ok_button.setEnabled(ok)
+
+    def get_result(self):
+        cp = ord(self.char_edit.text())
+        fname = sanitize_filename(self.filename_edit.text()) or default_filename(cp)
+        base, i = fname, 1
+        while fname.lower() in self.existing_filenames:
+            i += 1
+            fname = f"{base}_{i}"
+        return cp, fname
+
+
 # ================================================================ startup dialogs
 
 class StartDialog(QDialog):
@@ -359,6 +663,7 @@ class StartDialog(QDialog):
             "project_name": project_name,
             "project_path": project_path,
             "font_size": font_size,
+            "glyphs": default_glyph_entries(),
         }
         config_path = os.path.join(project_path, "config.json")
         with open(config_path, 'w', encoding='utf-8') as f:
@@ -484,7 +789,10 @@ def glyph_to_svg(grid, char):
         "viewBox": f"0 0 {grid.size} {grid.size}",
         "shape-rendering": "crispEdges",
     })
-    root.append(ET.Comment(f" Glyph '{char}' ({grid.size}x{grid.size}) "))
+    # Use a safe label in the comment: some glyphs (space, control-ish
+    # punctuation) don't render usefully as a literal character.
+    label = char if char.isprintable() and not char.isspace() else f"U+{ord(char):04X}"
+    root.append(ET.Comment(f" Glyph '{label}' ({grid.size}x{grid.size}) "))
     for y in range(grid.size):
         for x in range(grid.size):
             if grid.get(x, y):
@@ -527,29 +835,37 @@ def _packed_rows(grid):
 
 # ================================================================ export: .h
 
-def export_h(grids_by_size, path):
+def export_h(entries, grids_by_size, path):
     L = [
         "// Generated by PixelFont Studio",
         "#pragma once",
         "#include <stdint.h>",
         "",
         "// Rows go top->bottom, bits packed MSB-first.",
-        "// Glyph order: A..Z, a..z.",
+        "// Glyph order matches the *_codepoints[] array below — the",
+        "// glyph set is project-defined, not a fixed alphabet.",
         "",
     ]
+    n = len(entries)
     for s in SIZES:
         grids = grids_by_size[s]
         total = s * s // 8
         L += [
-            f"#define PIXFONT_{s}x{s}_CHARS {len(GLYPHS)}",
+            f"#define PIXFONT_{s}x{s}_CHARS {n}",
             f"#define PIXFONT_{s}x{s}_W {s}",
             f"#define PIXFONT_{s}x{s}_H {s}",
-            f"static const uint8_t pixfont_{s}x{s}[{len(GLYPHS)}][{total}] = {{",
+            f"static const uint32_t pixfont_{s}x{s}_codepoints[{n}] = {{",
+            "    " + ", ".join(f"0x{e['codepoint']:04X}" for e in entries),
+            "};",
+            f"static const uint8_t pixfont_{s}x{s}[{n}][{total}] = {{",
         ]
-        for ch in GLYPHS:
-            grid = grids.get(ch) or GlyphGrid(s)
+        for e in entries:
+            cp = e["codepoint"]
+            grid = grids.get(cp) or GlyphGrid(s)
             rows = ["0x" + "".join(f"{b:02X}" for b in r) for r in _packed_rows(grid)]
-            L.append(f"    /* '{ch}' 0x{ord(ch):02X} */ {{ {','.join(rows)} }},")
+            ch = chr(cp)
+            label = ch if ch.isprintable() and not ch.isspace() else f"U+{cp:04X}"
+            L.append(f"    /* '{label}' 0x{cp:04X} */ {{ {','.join(rows)} }},")
         L += ["};", ""]
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(L))
@@ -557,7 +873,7 @@ def export_h(grids_by_size, path):
 
 # ================================================================ export: .bdf
 
-def export_bdf(size, grids, path):
+def export_bdf(entries, size, grids, path):
     L = [
         "STARTFONT 2.1",
         f"FONT -PixelFont-Regular-R-Normal--{size}-{size * 10}-75-75-P-{size * 10}-ISO10646-1",
@@ -567,13 +883,16 @@ def export_bdf(size, grids, path):
         f"FONT_ASCENT {size}",
         "FONT_DESCENT 0",
         "ENDPROPERTIES",
-        f"CHARS {len(GLYPHS)}",
+        f"CHARS {len(entries)}",
     ]
-    for ch in GLYPHS:
-        grid = grids.get(ch, GlyphGrid(size))
+    for e in entries:
+        cp = e["codepoint"]
+        grid = grids.get(cp, GlyphGrid(size))
+        # Always use a "uniXXXX" glyph name: literal characters (spaces,
+        # quotes, non-ASCII symbols) are not valid/safe BDF glyph names.
         L += [
-            f"STARTCHAR {ch}",
-            f"ENCODING {ord(ch)}",
+            f"STARTCHAR uni{cp:04X}",
+            f"ENCODING {cp}",
             "SWIDTH 1000 0",
             f"DWIDTH {size} 0",
             f"BBX {size} {size} 0 0",
@@ -588,7 +907,7 @@ def export_bdf(size, grids, path):
 
 # ================================================================ export: .otf / .ttf / .ttc
 
-def export_vector_font(size, grids, path):
+def export_vector_font(entries, size, grids, path):
     try:
         from fontTools.fontBuilder import FontBuilder
         from fontTools.pens.ttGlyphPen import TTGlyphPen
@@ -600,12 +919,13 @@ def export_vector_font(size, grids, path):
     upem = 1024
     k = upem / size
     order, cmap, hm, glyphs = [], {}, {}, {}
-    for ch in GLYPHS:
-        name = f"uni{ord(ch):04X}"
+    for e in entries:
+        cp = e["codepoint"]
+        name = f"uni{cp:04X}"
         order.append(name)
-        cmap[ord(ch)] = name
+        cmap[cp] = name
         hm[name] = (upem, 0)
-        grid = grids.get(ch, GlyphGrid(size))
+        grid = grids.get(cp, GlyphGrid(size))
         rects = []
         for y in range(size):
             for x in range(size):
@@ -642,9 +962,9 @@ def export_vector_font(size, grids, path):
     fb.save(path)
 
 
-def export_ttf(size, grids, path):
+def export_ttf(entries, size, grids, path):
     """Plain .ttf — same engine, correct extension."""
-    export_vector_font(size, grids, path)
+    export_vector_font(entries, size, grids, path)
 
 
 def build_ttc(ttf_paths, out_path):
@@ -864,13 +1184,20 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PixelFont Studio")
-        self.resize(1100, 720)
+        self.resize(1150, 720)
         self.project_dir = ""
-        self.grids = {}          # (char, size) -> GlyphGrid
+        self.grids = {}            # (codepoint, size) -> GlyphGrid
+        self.glyph_entries = []    # [{"codepoint": int, "filename": str}, ...]
         self.undo_stack = []
+        # The glyph/size actually loaded into the editor right now. Kept
+        # separately from the widgets' live state so that switching the
+        # selection can flush edits to the *previous* glyph, not the new
+        # one (see on_selection_change / store_current).
+        self._current_key = (None, SIZES[0])
 
         self._build_ui()
         self._build_shortcuts()
+        self.load_project_glyphs()
         self.load_current()
 
     def _build_ui(self):
@@ -879,31 +1206,6 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(14, 14, 14, 10)
         root.setSpacing(12)
-
-        # --- glyph/size selector row
-        sel = QFrame()
-        sel.setProperty("class", "card")
-        sel.setProperty("role", "selector")
-        sl = QHBoxLayout(sel)
-        sl.setContentsMargins(12, 10, 12, 10)
-        sl.setSpacing(10)
-        lab = QLabel("Glyph:")
-        lab.setProperty("role", "dim")
-        sl.addWidget(lab)
-        self.glyph_combo = QComboBox()
-        for ch in GLYPHS:
-            self.glyph_combo.addItem(f"{ch}  (U+{ord(ch):04X})", ch)
-        self.glyph_combo.setMinimumWidth(150)
-        sl.addWidget(self.glyph_combo)
-        lab = QLabel("Size:")
-        lab.setProperty("role", "dim")
-        sl.addWidget(lab)
-        self.size_combo = QComboBox()
-        for s in SIZES:
-            self.size_combo.addItem(f"{s}×{s}", s)
-        sl.addWidget(self.size_combo)
-        sl.addStretch()
-        root.addWidget(sel)
 
         # --- toolbar
         tools = QFrame()
@@ -945,10 +1247,55 @@ class MainWindow(QMainWindow):
         tl.addWidget(build_btn)
         root.addWidget(tools)
 
-        # --- editor + side panel (splitter lets you resize the proportions)
+        # --- left panel (glyph/size selection) + editor + preview
         split = QSplitter(Qt.Orientation.Horizontal)
         split.setHandleWidth(10)
 
+        # left: size selector + glyph registry list
+        glyph_panel = QFrame()
+        glyph_panel.setProperty("class", "card")
+        gpl = QVBoxLayout(glyph_panel)
+        gpl.setContentsMargins(12, 12, 12, 12)
+        gpl.setSpacing(8)
+
+        size_row = QHBoxLayout()
+        lab = QLabel("Size:")
+        lab.setProperty("role", "dim")
+        size_row.addWidget(lab)
+        self.size_combo = QComboBox()
+        for s in SIZES:
+            self.size_combo.addItem(f"{s}×{s}", s)
+        self.size_combo.currentIndexChanged.connect(self.on_selection_change)
+        size_row.addWidget(self.size_combo, 1)
+        gpl.addLayout(size_row)
+
+        lab = QLabel("Glyphs")
+        lab.setProperty("role", "dim")
+        gpl.addWidget(lab)
+
+        self.glyph_search = QLineEdit()
+        self.glyph_search.setPlaceholderText("Filter…")
+        self.glyph_search.textChanged.connect(lambda _t: self.refresh_glyph_list())
+        gpl.addWidget(self.glyph_search)
+
+        self.glyph_list = QListWidget()
+        self.glyph_list.currentItemChanged.connect(lambda _c, _p: self.on_selection_change())
+        gpl.addWidget(self.glyph_list, 1)
+
+        glyph_btns = QHBoxLayout()
+        add_btn = QPushButton("+ Add")
+        add_btn.setProperty("role", "accent")
+        add_btn.clicked.connect(self.add_glyph)
+        remove_btn = QPushButton("− Remove")
+        remove_btn.setProperty("role", "ghost")
+        remove_btn.clicked.connect(self.remove_glyph)
+        glyph_btns.addWidget(add_btn)
+        glyph_btns.addWidget(remove_btn)
+        gpl.addLayout(glyph_btns)
+
+        split.addWidget(glyph_panel)
+
+        # middle: the drawing canvas
         editor_card = QFrame()
         editor_card.setProperty("class", "card")
         ecl = QVBoxLayout(editor_card)
@@ -959,6 +1306,7 @@ class MainWindow(QMainWindow):
         ecl.addWidget(self.editor, 1)
         split.addWidget(editor_card)
 
+        # right: preview + tips
         side = QFrame()
         side.setProperty("class", "card")
         sdl = QVBoxLayout(side)
@@ -986,11 +1334,8 @@ class MainWindow(QMainWindow):
         sdl.addStretch()
         split.addWidget(side)
 
-        split.setSizes([700, 350])
+        split.setSizes([260, 640, 320])
         root.addWidget(split, 1)
-
-        self.glyph_combo.currentIndexChanged.connect(self.on_selection_change)
-        self.size_combo.currentIndexChanged.connect(self.on_selection_change)
 
         self.statusBar().showMessage("Ready")
 
@@ -1013,17 +1358,130 @@ class MainWindow(QMainWindow):
     def status(self, msg):
         self.statusBar().showMessage(msg)
 
+    # ---------- glyph registry ----------
+
+    def load_project_glyphs(self):
+        entries = None
+        if self.project_dir:
+            config_path = os.path.join(self.project_dir, "config.json")
+            if os.path.exists(config_path):
+                try:
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    entries = cfg.get("glyphs")
+                except (OSError, json.JSONDecodeError):
+                    entries = None
+            if not entries:
+                entries = discover_legacy_glyphs(self.project_dir)
+        if not entries:
+            entries = default_glyph_entries()
+        self.glyph_entries = entries
+        self.refresh_glyph_list()
+
+    def save_project_glyphs(self):
+        if not self.project_dir:
+            return
+        os.makedirs(self.project_dir, exist_ok=True)
+        config_path = os.path.join(self.project_dir, "config.json")
+        cfg = {}
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                cfg = {}
+        cfg["glyphs"] = self.glyph_entries
+        cfg.setdefault("project_path", self.project_dir)
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=4)
+
+    def entry_for(self, cp):
+        for e in self.glyph_entries:
+            if e["codepoint"] == cp:
+                return e
+        return None
+
+    def refresh_glyph_list(self):
+        prev_cp = self._current_key[0]
+        query = self.glyph_search.text().strip().lower()
+        self.glyph_list.blockSignals(True)
+        self.glyph_list.clear()
+        for entry in sorted(self.glyph_entries, key=lambda e: e["codepoint"]):
+            cp = entry["codepoint"]
+            ch = chr(cp)
+            shown = ch if ch.isprintable() and not ch.isspace() else "·"
+            label = f"U+{cp:04X}   {shown}   {entry['filename']}"
+            if query and query not in label.lower():
+                continue
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, cp)
+            self.glyph_list.addItem(item)
+        self.glyph_list.blockSignals(False)
+
+        restored = False
+        if prev_cp is not None:
+            for i in range(self.glyph_list.count()):
+                if self.glyph_list.item(i).data(Qt.ItemDataRole.UserRole) == prev_cp:
+                    self.glyph_list.setCurrentRow(i)
+                    restored = True
+                    break
+        if not restored and self.glyph_list.count():
+            self.glyph_list.setCurrentRow(0)
+        elif not self.glyph_list.count():
+            # nothing left to select — make sure stale state doesn't linger
+            self._current_key = (None, self._current_key[1])
+
+    def add_glyph(self):
+        existing_cps = {e["codepoint"] for e in self.glyph_entries}
+        existing_names = {e["filename"].lower() for e in self.glyph_entries}
+        dlg = AddGlyphDialog(existing_cps, existing_names, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            cp, fname = dlg.get_result()
+            self.glyph_entries.append({"codepoint": cp, "filename": fname})
+            self.save_project_glyphs()
+            self._current_key = (cp, self._current_key[1])  # select the new glyph on refresh
+            self.refresh_glyph_list()
+            self.status(f"Added glyph U+{cp:04X}")
+
+    def remove_glyph(self):
+        cp, size = self.current_key()
+        if cp is None:
+            return
+        entry = self.entry_for(cp)
+        label = entry["filename"] if entry else f"U+{cp:04X}"
+        reply = QMessageBox.question(
+            self, "Remove Glyph",
+            f"Remove '{label}' (U+{cp:04X}) from the project's glyph list?\n"
+            "This only removes it from the list — any .svg files already "
+            "saved to disk are left untouched.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.glyph_entries = [e for e in self.glyph_entries if e["codepoint"] != cp]
+        for s in SIZES:
+            self.grids.pop((cp, s), None)
+        self._current_key = (None, size)  # prevent a stale flush from re-adding it
+        self.save_project_glyphs()
+        self.refresh_glyph_list()
+        self.load_current()
+        self.status(f"Removed U+{cp:04X} from the glyph list")
+
     # ---------- glyph handling ----------
 
     def current_key(self):
-        return self.glyph_combo.currentData(), self.size_combo.currentData()
+        item = self.glyph_list.currentItem()
+        cp = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return cp, self.size_combo.currentData()
 
-    def get_grid(self, ch, size, create=False):
-        key = (ch, size)
+    def get_grid(self, cp, size, create=False):
+        if cp is None:
+            return GlyphGrid(size) if create else None
+        key = (cp, size)
         if key in self.grids:
             return self.grids[key]
-        if self.project_dir:
-            path = os.path.join(self.project_dir, f"size_{size}", f"{ord(ch):02X}_{ch}.svg")
+        entry = self.entry_for(cp)
+        if self.project_dir and entry:
+            path = os.path.join(self.project_dir, f"size_{size}", f"{entry['filename']}.svg")
             if os.path.exists(path):
                 try:
                     g = svg_to_glyph(path, size)
@@ -1037,26 +1495,34 @@ class MainWindow(QMainWindow):
         return None
 
     def render_char(self, ch, size):
-        g = self.get_grid(ch, size)
+        g = self.get_grid(ord(ch), size)
         return g if g else GlyphGrid(size)
 
     def load_current(self):
-        ch, size = self.current_key()
-        g = self.get_grid(ch, size, create=True)
+        # Reads the *new* widget state and adopts it as the current key.
+        cp, size = self.current_key()
+        self._current_key = (cp, size)
+        g = self.get_grid(cp, size, create=True)
         self.editor.set_grid(g)
         self.undo_stack.clear()
         self.preview.size_variant = size
         self.preview.update()
 
     def on_selection_change(self):
+        # IMPORTANT: store_current() must run BEFORE the widgets' new
+        # selection is adopted, using the key that was active a moment
+        # ago — otherwise the just-edited pixels get written under the
+        # *new* glyph's key/file instead of the old one.
         self.store_current()
         self.load_current()
 
     def store_current(self):
-        ch, size = self.current_key()
-        self.grids[(ch, size)] = self.editor.get_grid()
+        cp, size = self._current_key
+        if cp is None:
+            return
+        self.grids[(cp, size)] = self.editor.get_grid()
         if self.project_dir:
-            self.write_svg(ch, size)
+            self.write_svg(cp, size)
 
     # ---------- events ----------
 
@@ -1070,31 +1536,40 @@ class MainWindow(QMainWindow):
     # ---------- SVG ----------
 
     def save_glyph(self):
-        ch, size = self.current_key()
+        cp, size = self.current_key()
+        if cp is None:
+            self.status("No glyph selected")
+            return
         if not self.project_dir:
             d = QFileDialog.getExistingDirectory(self, "Select the project folder")
             if not d:
                 return
             self.project_dir = d
-        self.grids[(ch, size)] = self.editor.get_grid()
-        self.write_svg(ch, size)
-        self.status(f"Saved: {ch} {size}×{size} → size_{size}/")
+        self.grids[(cp, size)] = self.editor.get_grid()
+        self.write_svg(cp, size)
+        self.status(f"Saved: U+{cp:04X} {size}×{size} → size_{size}/")
 
-    def write_svg(self, ch, size):
+    def write_svg(self, cp, size):
+        entry = self.entry_for(cp)
+        if not entry:
+            return
         d = os.path.join(self.project_dir, f"size_{size}")
         os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, f"{ord(ch):02X}_{ch}.svg"), "wb") as f:
-            f.write(glyph_to_svg(self.grids[(ch, size)], ch))
+        with open(os.path.join(d, f"{entry['filename']}.svg"), "wb") as f:
+            f.write(glyph_to_svg(self.grids[(cp, size)], chr(cp)))
 
     def load_glyph(self):
-        ch, size = self.current_key()
+        cp, size = self.current_key()
+        if cp is None:
+            self.status("No glyph selected")
+            return
         path, _ = QFileDialog.getOpenFileName(self, "Open .svg", "", "SVG (*.svg)")
         if not path:
             return
         try:
             g = svg_to_glyph(path, size)
             self.editor.set_grid(g)
-            self.grids[(ch, size)] = g
+            self.grids[(cp, size)] = g
             self.status(f"Loaded: {os.path.basename(path)}")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to parse SVG:\n{e}")
@@ -1105,6 +1580,7 @@ class MainWindow(QMainWindow):
             return
         self.project_dir = d
         self.grids.clear()
+        self.load_project_glyphs()
         self.load_current()
         self.status(f"Project opened: {d}")
 
@@ -1140,6 +1616,10 @@ class MainWindow(QMainWindow):
     # ---------- build ----------
 
     def build_font(self):
+        if not self.glyph_entries:
+            QMessageBox.warning(self, "Build Font", "The glyph list is empty — add at least one glyph first.")
+            return
+
         # Default the output folder to <project>/out — it's already created
         # for every project, so the user shouldn't have to pick it manually.
         default_out = os.path.join(self.project_dir, "out") if self.project_dir else ""
@@ -1159,26 +1639,28 @@ class MainWindow(QMainWindow):
                 return
 
         self.store_current()
-        by_size = {s: {c: self.get_grid(c, s, create=True) for c in GLYPHS} for s in SIZES}
+        entries = sorted(self.glyph_entries, key=lambda e: e["codepoint"])
+        by_size = {s: {e["codepoint"]: self.get_grid(e["codepoint"], s, create=True) for e in entries}
+                  for s in SIZES}
 
         try:
             if r["h"]:
-                export_h(by_size, os.path.join(out, "pixelfont.h"))
+                export_h(entries, by_size, os.path.join(out, "pixelfont.h"))
 
             if r["bdf"]:
                 for s in SIZES:
-                    export_bdf(s, by_size[s], os.path.join(out, f"pixelfont_{s}px.bdf"))
+                    export_bdf(entries, s, by_size[s], os.path.join(out, f"pixelfont_{s}px.bdf"))
 
             # separate vector files (also needed for .ttc)
             ttf_paths = {}
             if r["otf"] or r["ttf"]:
                 for s in SIZES:
                     if r["otf"]:
-                        export_vector_font(s, by_size[s],
+                        export_vector_font(entries, s, by_size[s],
                                            os.path.join(out, f"pixelfont_{s}px.otf"))
                     if r["ttf"]:
                         p = os.path.join(out, f"pixelfont_{s}px.ttf")
-                        export_ttf(s, by_size[s], p)
+                        export_ttf(entries, s, by_size[s], p)
                         if r["ttc"]:
                             ttf_paths[s] = p
 
@@ -1188,7 +1670,7 @@ class MainWindow(QMainWindow):
                 for s in SIZES:
                     p = ttf_paths.get(s, os.path.join(out, f"pixelfont_{s}px.ttf"))
                     if not os.path.exists(p):
-                        export_ttf(s, by_size[s], p)
+                        export_ttf(entries, s, by_size[s], p)
                     paths.append(p)
                 build_ttc(paths, os.path.join(out, "pixelfont.ttc"))
         except Exception as e:
@@ -1227,6 +1709,7 @@ if __name__ == "__main__":
     if cfg and os.path.isdir(cfg.get("project_path", "")):
         w.project_dir = cfg["project_path"]
         w.grids.clear()
+        w.load_project_glyphs()
         font_size = cfg.get("font_size")
         if font_size in SIZES:
             idx = w.size_combo.findData(font_size)
