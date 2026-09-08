@@ -653,11 +653,11 @@ class StartDialog(QDialog):
                                     "font_size": config.get("font_size")}
                 self.accept()
             else:
-                QMessageBox.warning(self, "Error", "The selected directory does not contain src and out folders.")
+                QMessageBox.warning(self, "Error", "The selected directory does not contain an out folder.")
 
     def save_config(self, project_path, project_name, font_size):
         # The config is stored inside the project folder itself (project_path),
-        # not in the parent folder — otherwise it wouldn't match the src/out folders.
+        # not in the parent folder — otherwise it wouldn't match the out folder.
         os.makedirs(project_path, exist_ok=True)
         config = {
             "project_name": project_name,
@@ -678,11 +678,10 @@ class StartDialog(QDialog):
 
     def create_directories(self, base_path, project_name):
         project_path = os.path.join(base_path, project_name)
-        os.makedirs(os.path.join(project_path, "src"), exist_ok=True)
         os.makedirs(os.path.join(project_path, "out"), exist_ok=True)
 
     def validate_project_structure(self, project_path):
-        return os.path.exists(os.path.join(project_path, "src")) and os.path.exists(os.path.join(project_path, "out"))
+        return os.path.exists(os.path.join(project_path, "out"))
 
 
 class NewProjectDialog(QDialog):
