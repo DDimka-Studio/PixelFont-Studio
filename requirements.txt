@@ -1,0 +1,3 @@
+PyQt6>=6.5
+fonttools>=4.40
+Pillow>=10.0

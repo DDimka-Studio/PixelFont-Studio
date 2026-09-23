@@ -14,8 +14,14 @@ Every glyph is stored as a separate .svg file, which can be edited with
 any editor and loaded back in.
 Export formats: .otf, .ttf, .ttc, .bdf, .h
 
+Existing fonts (e.g. Monocraft) can also be imported: pick a .ttf/.otf
+file via "⬇ Import Font", choose a size and a set of characters, and
+each imported glyph is rasterized into the grid so it can be edited and
+saved like any hand-drawn glyph. See README.md for details.
+
 Dependencies:
-    pip install PyQt6 fonttools
+    pip install -r requirements.txt
+    (PyQt6, fonttools, Pillow — see requirements.txt)
 
 Run:
     python pixelfont_studio.py
@@ -36,6 +42,12 @@ from PyQt6.QtWidgets import (
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPushButton, QSplitter, QVBoxLayout, QWidget,
 )
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 SVG_NS = "http://www.w3.org/2000/svg"
 SIZES = [8, 16, 32]
@@ -594,6 +606,110 @@ class AddGlyphDialog(QDialog):
 
 # ================================================================ startup dialogs
 
+# ================================================================ import-font dialog
+
+class ImportFontDialog(QDialog):
+    """Lets the user pick an existing .ttf/.otf font file, a target grid
+    size, and a set of characters. Only used to *collect the request* —
+    the actual rasterization happens in MainWindow.import_font()."""
+
+    def __init__(self, current_size, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import Font")
+        self.setMinimumWidth(420)
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        lab = QLabel("Font file (.ttf / .otf):")
+        lab.setProperty("role", "dim")
+        lay.addWidget(lab)
+        file_row = QHBoxLayout()
+        self.file_edit = QLineEdit()
+        self.file_edit.setPlaceholderText("e.g. Monocraft.ttf")
+        file_row.addWidget(self.file_edit, 1)
+        browse_btn = QPushButton("…")
+        browse_btn.clicked.connect(self._browse)
+        file_row.addWidget(browse_btn)
+        lay.addLayout(file_row)
+
+        lab = QLabel("Grid size:")
+        lab.setProperty("role", "dim")
+        lay.addWidget(lab)
+        self.size_combo = QComboBox()
+        for s in SIZES:
+            self.size_combo.addItem(f"{s}×{s}", s)
+        idx = self.size_combo.findData(current_size)
+        if idx >= 0:
+            self.size_combo.setCurrentIndex(idx)
+        lay.addWidget(self.size_combo)
+
+        lab = QLabel("Characters to import:")
+        lab.setProperty("role", "dim")
+        lay.addWidget(lab)
+        self.chars_edit = QLineEdit("".join(IMPORT_DEFAULT_CHARS))
+        lay.addWidget(self.chars_edit)
+        hint = QLabel("Each character here becomes one glyph. Remove or add "
+                      "characters freely — duplicates and characters missing "
+                      "from the font are skipped automatically.")
+        hint.setProperty("role", "dim")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        self.skip_existing = QCheckBox("Skip characters already in the project")
+        self.skip_existing.setChecked(True)
+        lay.addWidget(self.skip_existing)
+
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet("color: #ff6b6b;")
+        self.error_label.setWordWrap(True)
+        lay.addWidget(self.error_label)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self._try_accept)
+        bb.rejected.connect(self.reject)
+        self.ok_button = bb.button(QDialogButtonBox.StandardButton.Ok)
+        self.ok_button.setProperty("role", "accent")
+        lay.addWidget(bb)
+
+    def _browse(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select a font file", "", "Fonts (*.ttf *.otf);;All files (*)")
+        if path:
+            self.file_edit.setText(path)
+
+    def _try_accept(self):
+        if not PIL_AVAILABLE:
+            self.error_label.setText(
+                "Pillow is not installed. Run: pip install Pillow "
+                "(or: pip install -r requirements.txt)")
+            return
+        path = self.file_edit.text().strip()
+        if not path or not os.path.isfile(path):
+            self.error_label.setText("Choose a valid font file.")
+            return
+        if not self.chars_edit.text():
+            self.error_label.setText("Enter at least one character to import.")
+            return
+        self.accept()
+
+    def get_result(self):
+        # De-duplicate while preserving order.
+        seen = set()
+        chars = []
+        for ch in self.chars_edit.text():
+            if ch not in seen:
+                seen.add(ch)
+                chars.append(ch)
+        return {
+            "font_path": self.file_edit.text().strip(),
+            "size": self.size_combo.currentData(),
+            "chars": chars,
+            "skip_existing": self.skip_existing.isChecked(),
+        }
+
+
 class StartDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -814,6 +930,57 @@ def svg_to_glyph(path, expected_size):
         for gx in range(max(0, int(round(x))), min(expected_size, int(round(x1)))):
             for gy in range(max(0, int(round(y))), min(expected_size, int(round(y1)))):
                 grid.px[gy][gx] = True
+    return grid
+
+
+# ================================================================ font import
+
+# A reasonable default character set for a first import pass: the same
+# Latin letters new projects start with, plus digits and the punctuation
+# a monospace/pixel font like Monocraft typically ships with. The user
+# can edit this list freely in the Import Font dialog.
+IMPORT_DEFAULT_CHARS = (
+    DEFAULT_LATIN
+    + list("0123456789")
+    + list(" .,:;!?'\"-_/\\()[]{}+=*<>@#$%^&~`|")
+)
+
+
+def font_cmap_codepoints(font_path):
+    """Code points the font actually has glyphs for, via its cmap.
+    Used to skip characters that would just import as a blank/notdef box."""
+    from fontTools.ttLib import TTFont
+    font = TTFont(font_path, fontNumber=0, lazy=True)
+    try:
+        cmap = font.getBestCmap() or {}
+        return set(cmap.keys())
+    finally:
+        font.close()
+
+
+def rasterize_char(font_path, ch, size, supersample=8):
+    """Render one character from an installed/loaded font file into a
+    size x size boolean grid. Renders at a supersampled resolution and
+    box-downsamples, which handles both smooth and already-pixelated
+    source fonts reasonably well; the result is a starting point meant
+    to be touched up by hand, not a pixel-perfect conversion."""
+    if not PIL_AVAILABLE:
+        raise RuntimeError("Pillow is not installed (pip install Pillow)")
+    px = max(size * supersample, 8)
+    font = ImageFont.truetype(font_path, px)
+    img = Image.new("L", (px, px), 0)
+    draw = ImageDraw.Draw(img)
+    bbox = draw.textbbox((0, 0), ch, font=font)
+    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    x = (px - w) // 2 - bbox[0]
+    y = (px - h) // 2 - bbox[1]
+    draw.text((x, y), ch, font=font, fill=255)
+    img = img.resize((size, size), Image.LANCZOS)
+    data = img.load()
+    grid = GlyphGrid(size)
+    for gy in range(size):
+        for gx in range(size):
+            grid.px[gy][gx] = data[gx, gy] > 127
     return grid
 
 
@@ -1216,6 +1383,7 @@ class MainWindow(QMainWindow):
             ("💾 Save .svg", self.save_glyph, ""),
             ("📂 Open .svg", self.load_glyph, ""),
             ("📁 Project folder…", self.open_project, ""),
+            ("⬇ Import Font…", self.import_font, ""),
         ]:
             b = QPushButton(label)
             if role:
@@ -1582,6 +1750,96 @@ class MainWindow(QMainWindow):
         self.load_project_glyphs()
         self.load_current()
         self.status(f"Project opened: {d}")
+
+    def import_font(self):
+        """Import glyphs from an existing font file (e.g. Monocraft.ttf):
+        each requested character is rasterized into a grid at the chosen
+        size, added to the project's glyph registry, and written out as
+        an editable .svg — same as any hand-drawn glyph from then on."""
+        if not PIL_AVAILABLE:
+            QMessageBox.warning(
+                self, "Import Font",
+                "Pillow is not installed.\n\nRun:\n  pip install Pillow\n"
+                "(or: pip install -r requirements.txt)")
+            return
+        if not self.project_dir:
+            d = QFileDialog.getExistingDirectory(self, "Select the project folder")
+            if not d:
+                return
+            self.project_dir = d
+            os.makedirs(os.path.join(self.project_dir, "out"), exist_ok=True)
+
+        dlg = ImportFontDialog(self.size_combo.currentData(), self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        r = dlg.get_result()
+        font_path, size, chars = r["font_path"], r["size"], r["chars"]
+
+        try:
+            available_cps = font_cmap_codepoints(font_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Font",
+                                 f"Could not read the font's character map:\n{e}")
+            return
+
+        existing_cps = {e["codepoint"] for e in self.glyph_entries}
+        existing_names = {e["filename"].lower() for e in self.glyph_entries}
+
+        imported, skipped_missing, skipped_existing, failed = [], 0, 0, []
+        for ch in chars:
+            cp = ord(ch)
+            if cp not in available_cps:
+                skipped_missing += 1
+                continue
+            if r["skip_existing"] and cp in existing_cps:
+                skipped_existing += 1
+                continue
+            try:
+                grid = rasterize_char(font_path, ch, size)
+            except Exception as e:
+                failed.append(f"U+{cp:04X}: {e}")
+                continue
+            entry = self.entry_for(cp)
+            if entry is None:
+                fname = default_filename(cp)
+                base = fname
+                n = 1
+                while fname.lower() in existing_names:
+                    n += 1
+                    fname = f"{base}_{n}"
+                existing_names.add(fname.lower())
+                entry = {"codepoint": cp, "filename": fname}
+                self.glyph_entries.append(entry)
+                existing_cps.add(cp)
+            self.grids[(cp, size)] = grid
+            self.write_svg(cp, size)
+            imported.append(cp)
+
+        self.save_project_glyphs()
+        self.refresh_glyph_list()
+        if imported:
+            self._current_key = (imported[0], size)
+            idx = self.size_combo.findData(size)
+            if idx >= 0:
+                self.size_combo.setCurrentIndex(idx)
+            self.refresh_glyph_list()
+            self.load_current()
+
+        summary = (f"Imported {len(imported)} glyph(s) from "
+                  f"{os.path.basename(font_path)} at {size}×{size}.")
+        details = []
+        if skipped_missing:
+            details.append(f"{skipped_missing} skipped (not in the font)")
+        if skipped_existing:
+            details.append(f"{skipped_existing} skipped (already in the project)")
+        if failed:
+            details.append(f"{len(failed)} failed")
+        if details:
+            summary += "\n" + ", ".join(details) + "."
+        if failed:
+            summary += "\n\n" + "\n".join(failed[:10])
+        QMessageBox.information(self, "Import Font", summary)
+        self.status(f"Imported {len(imported)} glyph(s) from {os.path.basename(font_path)}")
 
     # ---------- glyph operations ----------
 
